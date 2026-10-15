@@ -25,6 +25,10 @@ struct SamplerParams {
     uint64_t seed = 0;           // drives Philox, which is counter-based on (seed, token index)
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
+    // Temporary per-request EOS exclusions; negative ids disable each slot.
+    int blocked0 = -1;
+    int blocked1 = -1;
+    bool blocks_tokens() const { return blocked0 >= 0 || blocked1 >= 0; }
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
 };
@@ -41,7 +45,8 @@ struct SamplerParams {
 // recent tokens that row's pick follows, with any unused slots set to -1; only the last `p.penalty_last_n` of
 // each row are counted, and ids outside [0, n_vocab) are ignored.  Pass nullptr and 0 when no penalties apply.
 // A verify window's rows need DIFFERENT histories: row t follows the window's drafts 1..t (`penalty_rows`).
-void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+// With blocked ids, the request's temporary logits are masked in place. Unmasked calls do not modify them.
+void sample_tokens(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
@@ -80,7 +85,7 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
 // out[t] = the draft when kept, the residual sample when not, a plain sample on the last row; `p.counter` is the
 // window's first position, as sample_tokens.  False (nothing launched) where the split sampler cannot run - the
 // caller then calls sample_tokens (exact match).
-bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+bool sample_tokens_spec(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
 

@@ -1468,9 +1468,17 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+void sample_tokens(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0) return;
+    if (p.blocks_tokens()) {
+        auto* writable = logits;
+        strata::q_of(stream)->parallel_for(sycl::range<1>(n_tokens), [=](sycl::id<1> index) {
+            const size_t row = index[0] * (size_t) n_vocab;
+            if (p.blocked0 >= 0 && p.blocked0 < n_vocab) writable[row + p.blocked0] = -INFINITY;
+            if (p.blocked1 >= 0 && p.blocked1 < n_vocab) writable[row + p.blocked1] = -INFINITY;
+        });
+    }
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);

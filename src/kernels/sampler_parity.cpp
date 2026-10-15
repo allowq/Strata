@@ -484,6 +484,31 @@ int main(int argc, char** argv) {
     int bad = 0;
     const int NV = 512, NT = 4;
 
+    // Per-request token exclusions must apply before both greedy argmax and sampled top-k,
+    // independently for every row. The unmasked zero control selects a deliberately dominant EOS.
+    {
+        const int nv = 8, T = 4;
+        std::vector<float> logits((size_t) nv * T, -20.0f);
+        for (int t = 0; t < T; ++t) {
+            logits[(size_t) t * nv + 1] = 50.0f;
+            logits[(size_t) t * nv + 4] = 40.0f;
+            logits[(size_t) t * nv + 2 + (t & 1)] = 10.0f;
+        }
+        for (bool greedy : {true, false}) {
+            strata::kernels::SamplerParams p;
+            p.greedy = greedy; p.temperature = 1.0f; p.top_k = 1; p.top_p = 1.0f;
+            bad += run("token mask: absent", logits, T, p, {1, 1, 1, 1});
+            p.blocked0 = 1;
+            bad += run("token mask: one EOS", logits, T, p, {4, 4, 4, 4});
+            p.blocked1 = 4;
+            bad += run("token mask: both EOS, all rows", logits, T, p, {2, 3, 2, 3});
+            p.blocked1 = 1;
+            bad += run("token mask: duplicate id", logits, T, p, {4, 4, 4, 4});
+            p.blocked0 = -1; p.blocked1 = nv;
+            bad += run("token mask: invalid ids ignored", logits, T, p, {1, 1, 1, 1});
+        }
+    }
+
     // Request bias affects every target row, including greedy; omission leaves logits and the default pick intact.
     // Compare against an independently pre-biased input through each ctest sampler implementation.
     {

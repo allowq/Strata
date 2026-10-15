@@ -30,6 +30,7 @@ import base64
 import hashlib
 import hmac
 import codecs
+from copy import deepcopy
 import ctypes
 import json
 import math
@@ -59,7 +60,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            tool_choice_of, unmark_think_literals, THINK_END)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -149,9 +150,7 @@ VISION_START = "<|vision_start|>"
 REPEAT_STOP_TOKENS = 256
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
-REASONING_CLOSE = "\n</think>\n\n"
+# #1053 (opt-in): continue the same prefix once, masking early EOS until the parser observes a boundary.
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -298,6 +297,10 @@ class MockEngine:
             if self.delay:
                 time.sleep(self.delay)
             yield t
+
+
+class EmptyAnswerError(ValueError):
+    """A valid request could not produce a complete answer under its optional bounded recovery."""
 
 
 class EngineDied(RuntimeError):
@@ -778,6 +781,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_mask_tokens = False     # advertised by READY; never assume an older binary understands ban0/ban1
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -844,6 +848,8 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_mask_tokens = "token_mask" in f[2:]
+                self.info["token_mask"] = self.can_mask_tokens
                 break
         loading.set()
         if self.max_context <= 0:
@@ -1131,6 +1137,12 @@ class StrataEngine:
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        blocked = sampling.get("_strata_block_tokens", ())
+        if (not isinstance(blocked, (list, tuple)) or len(blocked) > 2
+                or any(not isinstance(t, int) or isinstance(t, bool) or t < 0 for t in blocked)):
+            raise ValueError("token mask requires at most two nonnegative token ids")
+        for i, token in enumerate(blocked):
+            keys += f" ban{i}={token}"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -3031,7 +3043,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.reasoning_close_retry = False            # #1053 (opt-in): one continuation after an empty natural stop
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -3104,6 +3116,7 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.think_end_id = getattr(tokenizer, "special_tokens", {}).get(THINK_END)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -4090,7 +4103,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                              token_thinking=self.reasoning_close_retry and self.think_end_id is not None)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -4119,12 +4133,25 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
-        answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        answered, close_retried = False, False          # #1053: content or a complete call; one continuation
+        masked_eos = False
+        unfinished_calls = set()
+
+        def track_answer(ev):
+            nonlocal answered
+            if ev.kind == "tool_start":
+                unfinished_calls.add(ev.call.id)
+            elif ev.kind == "tool_call":
+                unfinished_calls.discard(ev.call.id)
+                answered = True
+            elif ev.kind == "content" and (ev.text or "").strip():
+                answered = True
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
-        raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        raw_ids = []                                    # continued prefix excludes discarded EOS
+        raw_stops = []                                  # (prefix offset, id), diagnostic reconstruction only
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -4217,6 +4244,7 @@ class Service:
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        release_mask = False
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -4236,11 +4264,13 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
+                                    raw_stops.append((len(raw_ids), t))
+                                    if masked_eos:
+                                        raise EmptyAnswerError("the engine emitted a suppressed stop token during reasoning recovery")
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
                                     finish = "stop"
-                                    raw_ids.append(t)
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -4252,14 +4282,13 @@ class Service:
                                     break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
-                                evs = cut(parser.feed(piece))
+                                evs = cut(parser.feed(piece, think_end=t == self.think_end_id))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
-                                    if ev.kind in ("content", "tool_start", "tool_call"):
-                                        answered = True
+                                    track_answer(ev)
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -4294,6 +4323,9 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                                if masked_eos and parser.can_end_turn():
+                                    release_mask = True
+                                    break
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -4363,29 +4395,57 @@ class Service:
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
                         if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
+                                and not answered and not wrap and not opens
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                            # The natural stop settles held quotes and calls before deciding that the reply is empty.
+                            # A held close may already precede an answer; injecting another would hide that answer.
+                            settled = deepcopy(parser)
+                            settled_events = settled.finish(finish)
+                            settled_answer = any(ev.kind == "tool_call" or
+                                                 (ev.kind == "content" and (ev.text or "").strip())
+                                                 for ev in settled_events)
+                            # A truly unfinished thought resumes with its partial tags/quotes intact. Only
+                            # commit EOF settlement when it discovers an answer or a real reasoning boundary.
+                            if settled_answer or settled.can_end_turn():
+                                for ev in cut(parser.finish(finish)):
+                                    track_answer(ev)
+                                    self._note(n, [ev], st, rate)
+                                    yield "event", ev
+                                if stops is not None and stops.hit is None and stops.held:
+                                    held = stops.flush()
+                                    answered = answered or bool(held.strip())
+                                    self._note(n, [Event("content", held)], st, rate)
+                                    yield "event", Event("content", held)
+                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                                and not answered and not wrap and not opens and parser.state in ("reasoning", "rcall", "content")
+                                and (stops is None or stops.hit is None) and not cancel.is_set()):
+                            # Preserve the generated prefix. A premature EOS is retried under a temporary native
+                            # EOS mask; only the parser may declare a reasoning boundary or a complete tool call.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
-                            if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
-                                for t in extra:
-                                    n += 1
-                                    raw_ids.append(t)
-                                    thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t), protocol=True))
-                                    self._note(n, evs, st, rate)
-                                    for ev in evs:
-                                        yield "event", ev
-                                prompt = prompt + seg + extra
+                            if max_new - n >= 1:
+                                if not parser.can_end_turn():
+                                    if not getattr(self.engine, "can_mask_tokens", False):
+                                        raise EmptyAnswerError("reasoning recovery requires an engine with token_mask support; rebuild the engine")
+                                    if len(self.stop_ids) > 2:
+                                        raise EmptyAnswerError("reasoning recovery requires at most two stop token ids")
+                                    sampling = {**(sampling or {}), "_strata_block_tokens": sorted(self.stop_ids)}
+                                    masked_eos = True
+                                print("[strata] the reply stopped with no answer: continuing once "
+                                      "(reasoning_close_retry)" + ("; EOS masked while reasoning" if masked_eos else ""), flush=True)
+                                prompt = prompt + seg
                                 finish = "length"
                                 continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not (wrap or opens or release_mask) or cancel.is_set():
                             break
+                        if masked_eos:
+                            sampling = {k: v for k, v in (sampling or {}).items() if k != "_strata_block_tokens"}
+                            masked_eos = False
+                        if release_mask:
+                            print("[strata] reasoning recovery: parser boundary reached; EOS unmasked", flush=True)
+                            if n >= max_new:
+                                break
+                            prompt = prompt + seg
+                            continue
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
@@ -4493,12 +4553,17 @@ class Service:
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
-                            if os.environ.get("STRATA_DEBUG") and raw_ids:
-                                print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                            if os.environ.get("STRATA_DEBUG") and (raw_ids or raw_stops):
+                                debug_ids = list(raw_ids)
+                                for offset, token in reversed(raw_stops):
+                                    debug_ids.insert(offset, token)
+                                print(f"[strata] raw: {self.tok.decode(debug_ids)!r}", flush=True)
                                 held = len(parser.buf)
                                 if parser._think_quote is not None:
                                     held += sum(map(len, parser._think_quote.held))
-                                print(f"[strata] raw token tail: {raw_ids[-32:]} stop_ids={sorted(self.stop_ids)} "
+                                print(f"[strata] raw reasoning-close token positions: "
+                                      f"{[i for i, t in enumerate(debug_ids) if t == self.think_end_id]}", flush=True)
+                                print(f"[strata] raw token tail: {debug_ids[-32:]} stop_ids={sorted(self.stop_ids)} "
                                       f"parser={parser.state} held={held} engine_finish={last.get('finish')!r}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
@@ -4515,13 +4580,22 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            track_answer(ev)
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
-            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+            held = stops.flush()                      # the held tail was not a stop string after all
+            answered = answered or bool(held.strip())
+            yield "event", Event("content", held)
+        if (self.reasoning_close_retry and thinking and finish == "stop" and not cancel.is_set()
+                and (stops is None or stops.hit is None)):
+            if unfinished_calls:
+                raise EmptyAnswerError("the reply stopped with an unfinished tool call (reasoning_close_retry)")
+            if close_retried and not answered:
+                raise EmptyAnswerError("the reply stopped without an answer after one reasoning_close_retry continuation")
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
@@ -5530,6 +5604,8 @@ def make_handler(svc: Service):
                     self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EmptyAnswerError as e:
+                self._json(500, {"error": {"type": "server_error", "message": str(e)}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"

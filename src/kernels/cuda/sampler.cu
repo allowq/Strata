@@ -1236,11 +1236,27 @@ bool sample_greedy_cluster(const float* logits, int n_tokens, int n_vocab, int* 
 #endif
 }
 
-void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+namespace {
+__global__ void mask_tokens_kernel(float* logits, int rows, int nv, int first, int second) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    if (first >= 0 && first < nv) logits[(size_t) row * nv + first] = -INFINITY;
+    if (second >= 0 && second < nv) logits[(size_t) row * nv + second] = -INFINITY;
+}
+
+void mask_tokens(float* logits, int rows, int nv, const SamplerParams& p, void* stream) {
+    if (p.blocks_tokens())
+        mask_tokens_kernel<<<(rows + 127) / 128, 128, 0, (cudaStream_t) stream>>>(
+            logits, rows, nv, p.blocked0, p.blocked1);
+}
+}  // namespace
+
+void sample_tokens(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
     p.gumbel = p_in.gumbel || gumbel_env();            // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
+    mask_tokens(logits, n_tokens, n_vocab, p, stream);
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
         std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
                      p.penalty_last_n, (const void*) history, history_len);
@@ -1344,7 +1360,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 }
 
 
-bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+bool sample_tokens_spec(float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream) {
     if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return false;
@@ -1356,6 +1372,7 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
         return false;
     int2* scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
     if (scratch == nullptr) return false;
+    mask_tokens(logits, n_tokens, n_vocab, p, stream);
     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
                                 (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
     spec_verify_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,

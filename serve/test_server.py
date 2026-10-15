@@ -3638,14 +3638,14 @@ class ThinkingEngine(MockEngine):
 
 
 class EndsInsideThinkingEngine(ThinkingEngine):
-    """The #1053 reply: one sentence of reasoning, then the end-of-turn token, no </think>.  A prompt that ends the
-    thinking (the retry) gets the answer."""
+    """Early EOS; masking it permits a model-generated close, then the unmasked pass gives the answer."""
     THOUGHT = "Let me think: two plus two is four."
+    can_mask_tokens = True
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
-        done = self.tok.decode(ids).endswith("</think>" + chr(10) + chr(10))
-        text = self.ANSWER if done else self.THOUGHT
+        done = self.tok.decode(ids).endswith(("</think>", "</think>\n\n"))
+        text = self.ANSWER if done else "\n</think>\n\n" if sampling.get('_strata_block_tokens') else self.THOUGHT
         for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
@@ -3653,7 +3653,7 @@ class EndsInsideThinkingEngine(ThinkingEngine):
 
 
 class ReasoningCloseRetry(unittest.TestCase):
-    """#1053 (opt-in): a reply that ends inside <think> with no answer is continued once with the thinking closed."""
+    """#1053 (opt-in): recover an early EOS without injecting the model's reasoning boundary."""
 
     def setUp(self):
         self.tok = ByteTokenizer()
@@ -3678,11 +3678,12 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(self.engine.prompts.__len__(), 1)
         self.assertFalse(c["message"].get("content"))
 
-    def test_on_it_closes_the_thinking_once_and_answers(self):
+    def test_on_it_resumes_thinking_until_the_model_closes_it(self):
         self.svc.reasoning_close_retry = True
         c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 2)
-        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>" + chr(10) + chr(10)))
+        self.assertEqual(len(self.engine.prompts), 3)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith(self.engine.THOUGHT))
+        self.assertTrue(self.tok.decode(self.engine.prompts[2]).endswith("</think>"))
         self.assertEqual(c["message"]["content"], EndsInsideThinkingEngine.ANSWER)
         self.assertIn("two plus two is four", c["message"]["reasoning_content"])
         self.assertEqual(c["finish_reason"], "stop")
@@ -3694,14 +3695,17 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(c["message"]["content"], "Fine.")
 
-    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
-        # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
-        self.svc.reasoning_close_retry = True
+    def test_a_held_close_settles_before_optional_empty_answer_recovery(self):
+        # #537: EOF closes the held tag; only enabled recovery asks for the missing answer.
         self.engine.THOUGHT = 'two plus two is "4"</think>'
-        c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 1)
-        self.assertFalse(c["message"].get("content"))
-        self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+        for enabled in (False, True):
+            with self.subTest(recovery=enabled):
+                self.svc.reasoning_close_retry = enabled
+                self.engine.prompts.clear()
+                c = self.chat()
+                self.assertEqual(len(self.engine.prompts), 2 if enabled else 1)
+                self.assertEqual(c["message"].get("content") or "", self.engine.ANSWER if enabled else "")
+                self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
 
 
 class ThinkingBudget(unittest.TestCase):

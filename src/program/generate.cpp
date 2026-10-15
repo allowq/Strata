@@ -9668,7 +9668,7 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        std::printf("READY %lld stop token_mask\n", (long long) o.max_context);
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -10643,6 +10643,7 @@ int main(int argc, char** argv) {
             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
             // only).  Absent keys keep today's behavior: greedy, no penalties.
             float req_temperature = 0.0f, req_top_p = 1.0f;
+            int req_blocked0 = -1, req_blocked1 = -1;
             int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
@@ -10685,6 +10686,8 @@ int main(int argc, char** argv) {
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
+                    else if (key == "ban0") req_blocked0 = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ban1") req_blocked1 = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "min_p") req_min_p = fv;
@@ -11661,6 +11664,8 @@ int main(int argc, char** argv) {
             strata::kernels::SamplerParams req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
+            req_sp.blocked0 = req_blocked0;
+            req_sp.blocked1 = req_blocked1;
             req_sp.top_p = req_top_p;
             req_sp.top_k = req_top_k;
             req_sp.seed = req_seed ? req_seed

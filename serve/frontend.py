@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1011,7 +1011,7 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False):
+                 recover: bool = False, token_thinking: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -1028,6 +1028,11 @@ class OutputParser:
         self.rescued = 0             # calls delivered from the reasoning
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self._code, self._think_quote = _CodeContext(), None
+        # Native token provenance is opt-in. Ordinary text spelling </think> cannot end reasoning;
+        # a vocabulary token can, subject to the same quote guard. Offsets refer to the input stream,
+        # whose unconsumed suffix is buf (plus quote.held while a quote is undecided).
+        self._token_thinking = token_thinking
+        self._think_received, self._think_ends = 0, deque()
         # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
@@ -1092,6 +1097,11 @@ class OutputParser:
 
     def _opener_ok(self) -> bool:
         return self._code.opener_ok()
+
+    def can_end_turn(self) -> bool:
+        """A reasoning boundary or complete deferred call permits the end-of-turn token."""
+        return (self.state not in ("reasoning", "rcall")
+                or bool(self.pending and self.pending[-1][1] is not None))
 
     def _quoted_think_end(self, i: int) -> bool | None:
         """Keep upstream's ordinary-quote rule; Markdown quotes use the code context."""
@@ -1242,8 +1252,29 @@ class OutputParser:
         """A server-owned boundary may end pending code lookahead, but not a partial protocol tag."""
         return self.state == "reasoning" and (not self.buf or self._think_quote is not None)
 
+    def _find_think(self, start: int = 0) -> int:
+        if not self._token_thinking:
+            return self.buf.find(THINK_END, start)
+        base = self._think_received - len(self.buf)
+        while self._think_ends and self._think_ends[0] < base + start:
+            self._think_ends.popleft()
+        return self._think_ends[0] - base if self._think_ends else -1
+
     def feed(self, delta: str, *, _final: bool = False, protocol: bool = False,
-             _literal_tail: bool = False) -> list[Event]:
+             think_end: bool = False, _literal_tail: bool = False) -> list[Event]:
+        if self._token_thinking:
+            if self.state in ("reasoning", "rcall"):
+                if protocol:
+                    # A server-owned boundary is authoritative even without a vocabulary token.
+                    self._think_ends.extend(self._think_received + m.start()
+                                            for m in re.finditer(re.escape(THINK_END), delta))
+                elif think_end:
+                    if not delta.endswith(THINK_END):
+                        raise ValueError("a thinking-end token must decode to the closing marker")
+                    self._think_ends.append(self._think_received + len(delta) - len(THINK_END))
+            else:
+                self._think_ends.clear()
+            self._think_received += len(delta)
         # The server knows that its budget/retry injection is a real boundary. Flush the model's
         # pending quote as reasoning before reading it; Markdown cannot override that information.
         out: list[Event] = []
@@ -1265,7 +1296,9 @@ class OutputParser:
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
                 body = self.buf[len(CALL_START):]
-                end, think = call_end(body), body.find(THINK_END)
+                end, think = call_end(body), self._find_think(len(CALL_START))
+                if think >= 0:
+                    think -= len(CALL_START)
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
@@ -1305,14 +1338,14 @@ class OutputParser:
                         return out
                     if self.buf.startswith(CALL_START):
                         self.state = "rcall"
-                    elif self.buf.startswith(THINK_END):
+                    elif self._find_think() == 0:
                         out += self._release(True)
-                    elif CALL_START.startswith(self.buf) or THINK_END.startswith(self.buf):
+                    elif CALL_START.startswith(self.buf) or (not self._token_thinking and THINK_END.startswith(self.buf)):
                         return out
                     else:
                         out += self._release(False)
                     continue
-                i = self.buf.find(THINK_END)
+                i = self._find_think()
                 tool = self.buf.find(CALL_START) if self.schemas else -1
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
@@ -1325,7 +1358,8 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    tags = (() if self._token_thinking else (THINK_END,)) + ((CALL_START,) if self.schemas else ())
+                    keep = self._hold(self.buf, tags)
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
