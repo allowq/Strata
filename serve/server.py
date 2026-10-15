@@ -3044,6 +3044,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): one continuation after an empty natural stop
+        self.reasoning_final_reserve_tokens = 0        # opt-in: leave room for a final answer before max_tokens
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -4103,6 +4104,11 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
+        reserve = self.reasoning_final_reserve_tokens if thinking else 0
+        if reserve and max_new >= 2 * reserve:
+            # Compose after upstream's explicit-budget cap; do not cap an implicit reserve twice.
+            reserved_budget = max_new - reserve
+            budget = min(budget, reserved_budget) if budget else reserved_budget
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
                               token_thinking=self.reasoning_close_retry and self.think_end_id is not None)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -6865,6 +6871,12 @@ def main() -> int:
                   "again", flush=True)
         print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+    reserve = cfg.get("reasoning_final_reserve_tokens", 0)
+    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
+        raise SystemExit(f"[strata] config reasoning_final_reserve_tokens must be a whole number >= 0, not {reserve!r}")
+    if reserve and reserve <= len(tok.encode(REASONING_WRAP_UP, parse_special=True)):
+        raise SystemExit("[strata] config reasoning_final_reserve_tokens must fit the thinking wrap-up and at least one answer token")
+    svc.reasoning_final_reserve_tokens = reserve
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake

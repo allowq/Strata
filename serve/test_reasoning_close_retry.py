@@ -159,6 +159,56 @@ class ReasoningCloseRetry(unittest.TestCase):
         events = list(svc.run([], True, SCHEMA, len(tok.encode(raw)), {}, threading.Event()))
         self.assertEqual(events[-1][1]['finish'], 'length')
 
+    def test_repeated_reasoning_keeps_room_for_a_final_answer_when_opted_in(self):
+        from serve.server import ByteTokenizer, MockEngine, Service
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, [" ``" * 400, "OK"])
+        svc = Service(engine, tok, None)
+        svc.reasoning_close_retry = True
+        svc.reasoning_final_reserve_tokens = 128
+        events = list(svc.run([], True, [], 768, {}, threading.Event()))
+        evs = [ev for kind, ev in events if kind == "event"]
+        self.assertEqual(engine.turns, 2)
+        self.assertEqual(visible(evs, "content"), "OK")
+        self.assertEqual(events[-1][1]["finish"], "stop")
+
+    def test_repeated_reasoning_default_keeps_the_requested_limit(self):
+        from serve.server import ByteTokenizer, MockEngine, Service
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, [" ``" * 400, "OK"])
+        svc = Service(engine, tok, None)
+        svc.reasoning_close_retry = True
+        events = list(svc.run([], True, [], 768, {}, threading.Event()))
+        self.assertEqual(engine.turns, 1)
+        self.assertEqual(visible([ev for kind, ev in events if kind == "event"], "content"), "")
+        self.assertEqual(events[-1][1]["finish"], "length")
+
+    def test_final_reserve_requires_room_for_thinking_and_answer(self):
+        from serve.server import ByteTokenizer, MockEngine, Service
+        tok = ByteTokenizer()
+        for cap, turns, answer, finish in ((140, 1, "", "length"), (255, 1, "", "length"),
+                                           (256, 2, "OK", "stop")):
+            with self.subTest(max_tokens=cap):
+                engine = MockEngine(tok, [" ``" * 400, "OK"])
+                svc = Service(engine, tok, None)
+                svc.reasoning_final_reserve_tokens = 128
+                events = list(svc.run([], True, [], cap, {}, threading.Event()))
+                self.assertEqual(engine.turns, turns)
+                self.assertEqual(visible([ev for kind, ev in events if kind == "event"], "content"), answer)
+                self.assertEqual(events[-1][1]["finish"], finish)
+
+    def test_reserve_composes_with_upstream_budget_cap(self):
+        from serve.server import ByteTokenizer, MockEngine, Service, REASONING_WRAP_UP
+        for explicit, expected in ((0, 640), (768, 384), (40, 40)):
+            with self.subTest(explicit=explicit):
+                tok, thought = ByteTokenizer(), "ab " * 400
+                engine = MockEngine(tok, [thought, "OK"])
+                svc = Service(engine, tok, None)
+                svc.reasoning_final_reserve_tokens = 128
+                events = list(svc.run([], True, [], 768, {"reasoning_budget_tokens": explicit}, threading.Event()))
+                self.assertEqual(tok.decode(engine.last_prompt), thought[:expected] + REASONING_WRAP_UP)
+                self.assertEqual(visible([ev for kind, ev in events if kind == "event"], "content"), "OK")
+
 class EmptyAnswerApiError(unittest.TestCase):
     def check_api(self, api, stream, partial=False):
         import json

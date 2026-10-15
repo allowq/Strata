@@ -774,6 +774,11 @@ print(r.choices[0].message.content)
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+   `"reasoning_final_reserve_tokens": N` in the config optionally limits thinking to at most `max_tokens - N`,
+   using the same wrap-up, so a response that keeps thinking until its output limit has room to answer. It is off by
+   default; an explicit lower `reasoning_budget_tokens` still wins. N must fit the wrap-up and one answer token.
+   The reserve is applied only when `max_tokens` is at least 2N, leaving at least N tokens for thinking.
+   Shorter requests retain their usual length limit.
 - **A reply that ends inside its thinking (#1053, opt-in).** Some turns write a sentence of reasoning and then the
   end-of-turn token with no `</think>`: the content is empty and an agent stops. `"reasoning_close_retry": true` in
   `strata-<model>.json` closes the thinking once (as the thinking budget does) and continues, once per request, only for
